@@ -33,10 +33,24 @@ impl PanelSpace {
         let is_dock = !self.config.expand_to_edges();
 
         let mut num_lists = 0;
-        if self.config.plugins_wings.is_some() {
+        if self
+            .config
+            .plugins_wings
+            .as_ref()
+            .map(|l| l.0.len() + l.1.len())
+            .unwrap_or_default()
+            > 0
+        {
             num_lists += 2;
         }
-        if self.config.plugins_center.is_some() {
+        if self
+            .config
+            .plugins_center
+            .as_ref()
+            .map(|l| l.len())
+            .unwrap_or_default()
+            > 0
+        {
             num_lists += 1;
         }
 
@@ -46,12 +60,62 @@ impl PanelSpace {
                 *i = j;
             }
         };
-
-        let mut windows_right = self
+        let mut to_map: Vec<Window> = Vec::with_capacity(self.space.elements().count());
+        // must handle unmapped windows, and unmap windows that are too large for the current configuration.
+        let to_unmap = self
             .space
             .elements()
             .cloned()
-            .filter(|w| w.alive())
+            .filter(|w| {
+                if !w.alive() {
+                    return true;
+                }
+                let size = w.bbox().size.to_f64().downscale(self.scale).to_i32_round();
+
+                let constrained = self.constrain_dim(size, Some(gap as u32));
+
+                let unmap = if self.config.is_horizontal() {
+                        constrained.h < size.h
+                    } else {
+                        constrained.w < size.w
+                    };
+                if unmap {
+                    tracing::error!(
+                        "Window {size:?} is too large for what panel configuration allows {constrained:?}. It will be unmapped.",
+                    );
+                } else {
+                    to_map.push(w.clone());
+                }
+                unmap
+            })
+            .collect_vec();
+        for w in self.unmapped.drain(..).collect_vec() {
+            if w.alive() && {
+                let size = w.bbox().size.to_f64().downscale(self.scale).to_i32_round();
+
+                let constrained = self.constrain_dim(size, Some(gap as u32));
+                if self.config.is_horizontal() {
+                    constrained.h >= size.h
+                } else {
+                    constrained.w >= size.w
+                }
+            } {
+                to_map.push(w);
+            } else {
+                tracing::trace!("Window was unmapped and will stay so. {:?}", w.bbox());
+                self.unmapped.push(w);
+            }
+        }
+        for w in to_unmap {
+            self.space.unmap_elem(&w);
+            self.unmapped.push(w);
+        }
+
+        self.space.refresh();
+
+        let mut windows_right = to_map
+            .iter()
+            .cloned()
             .filter_map(|w| {
                 self.clients_right
                     .lock()
@@ -70,11 +134,9 @@ impl PanelSpace {
             .collect_vec();
         make_indices_contiguous(&mut windows_right);
 
-        let mut windows_center = self
-            .space
-            .elements()
+        let mut windows_center = to_map
+            .iter()
             .cloned()
-            .filter(|w| w.alive())
             .filter_map(|w| {
                 self.clients_center
                     .lock()
@@ -92,12 +154,9 @@ impl PanelSpace {
             })
             .collect_vec();
         make_indices_contiguous(&mut windows_center);
-
-        let mut windows_left = self
-            .space
-            .elements()
+        let mut windows_left = to_map
+            .iter()
             .cloned()
-            .filter(|w| w.alive())
             .filter_map(|w| {
                 self.clients_left
                     .lock()
@@ -140,19 +199,19 @@ impl PanelSpace {
             .iter()
             .map(|e| map_fn(e, anchor, Alignment::Center, self.scale));
         let center_sum_scaled = center.clone().map(|(_, _, length, _)| length).sum::<i32>() as f64
-            + spacing_scaled * (windows_center.len().max(1) as f64 - 1.0);
+            + spacing_scaled * (windows_center.len().max(1) - 1) as f64;
 
         let right = windows_right
             .iter()
             .map(|e| map_fn(e, anchor, Alignment::Right, self.scale));
 
         let right_sum_scaled = right.clone().map(|(_, _, length, _)| length).sum::<i32>() as f64
-            + spacing_scaled * (windows_right.len().max(1) as f64 - 1.0);
+            + spacing_scaled * (windows_right.len().max(1) - 1) as f64;
 
         let total_sum_scaled = left_sum_scaled + center_sum_scaled + right_sum_scaled;
         let new_list_length = (total_sum_scaled as f64
             + padding_scaled * 2.0
-            + spacing_scaled * (num_lists as f64 - 1.0)) as i32;
+            + spacing_scaled * (num_lists - 1) as f64) as i32;
         let new_list_thickness = (2.0 * padding_scaled
             + chain!(left.clone(), center.clone(), right.clone())
                 .map(|(_, _, _, thickness)| thickness)
@@ -169,7 +228,7 @@ impl PanelSpace {
         .to_logical(self.scale)
         .to_i32_round();
 
-        let actual_size_constrained = self.constrain_dim(self.actual_size);
+        let actual_size_constrained = self.constrain_dim(self.actual_size, Some(gap as u32));
         if self.config.is_horizontal() {
             self.actual_size.h = actual_size_constrained.h;
         } else {
@@ -301,7 +360,6 @@ impl PanelSpace {
         {
             let center_spacing = (requested_eq_length as f64 - center_sum) / 2.0;
             let left_spacing = requested_eq_length as f64 - left_sum - padding_u32 as f64;
-
             left_spacing + center_spacing
         } else {
             (container_length as f64 - left_sum - center_sum - right_sum - 2. * padding_u32 as f64)
@@ -380,10 +438,8 @@ impl PanelSpace {
         let mut prev: f64 = container_lengthwise_pos as f64 + padding_u32 as f64;
 
         prev = map_windows(windows_left.iter_mut(), prev);
-
         // will be already offset if dock
         prev += center_left_spacing;
-
         map_windows(windows_center.iter_mut(), prev);
 
         let prev = container_lengthwise_pos as f64 + container_length as f64
